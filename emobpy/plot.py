@@ -7,11 +7,9 @@ import os
 
 try:
     import plotly.graph_objects as go
-    from plotly.offline import iplot
+    import plotly.colors as pc
     from plotly.subplots import make_subplots
     from IPython.display import display, HTML
-    import cufflinks as cf
-    cf.go_offline()
 except ImportError:
     raise Exception("This plotly code only works within a jupyter notebook")
 
@@ -77,18 +75,61 @@ class NBplot:
                 .fillna(0)
         )
         cn.columns = cn.columns.droplevel()
-        rr = (cn.T / cn.T.sum(axis=0)).T
-        figa = rr.iplot(kind="area", fill=True, asFigure=True)
-        figb = df["distance"].iplot(asFigure=True)
-        fig = cf.subplots([figa, figb], shape=(2, 1), shared_xaxes=True)
-        fig["layout"]["yaxis"].update(
-            {"title": "Location", "rangemode": "tozero", "domain": [0.7, 1.0], 'tickformat':".1%"}
+        rr = (cn.T / cn.T.sum(axis=0)).T.astype(float)
+        # Plotly-native stacked area + line (avoids legacy third-party dataframe plotting)
+        palette = pc.qualitative.Plotly
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            row_heights=[0.32, 0.68],
         )
-        fig["layout"]["yaxis2"].update(
-            {"title": "Distance (km)", "rangemode": "tozero", "domain": [0.0, 0.65]}
+        for i, col in enumerate(rr.columns):
+            color = palette[i % len(palette)]
+            fig.add_trace(
+                go.Scatter(
+                    x=rr.index,
+                    y=rr[col],
+                    name=str(col),
+                    mode="lines",
+                    stackgroup="dp_states",
+                    line=dict(width=0.5, color=color),
+                    fillcolor=color,
+                    hovertemplate="%{y:.1%}<extra>%{fullData.name}</extra>",
+                ),
+                row=1,
+                col=1,
+            )
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["distance"].astype("float64"),
+                name="distance",
+                mode="lines",
+                line=dict(color="#636EFA"),
+            ),
+            row=2,
+            col=1,
         )
-
-        fig = go.Figure(data=fig["data"], layout=fig["layout"])
+        fig.update_yaxes(
+            title_text="Location",
+            rangemode="tozero",
+            tickformat=".1%",
+            row=1,
+            col=1,
+        )
+        fig.update_yaxes(
+            title_text="Distance (km)",
+            rangemode="tozero",
+            row=2,
+            col=1,
+        )
+        fig.update_layout(
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            margin=dict(l=10, r=10, t=20, b=10, pad=0),
+        )
         if to_html:
             if path is None:
                 raise Exception(
@@ -132,76 +173,109 @@ class NBplot:
                 .fillna(0)
         )
         cn.columns = cn.columns.droplevel()
-        rr = (cn.T / cn.T.sum(axis=0)).T
-        figa = rr.iplot(kind="area", fill=True, asFigure=True)
+        rr = (cn.T / cn.T.sum(axis=0)).T.astype(float)
         dk = dt[["consumption", "charging_cap"]]
-        figb = dk.iplot(asFigure=True)
-        dd = dt["soc"]
-        figc = dd.iplot(asFigure=True)
-        fig = cf.subplots([figa, figb, figc], shape=(3, 1), shared_xaxes=True)
-        fig["layout"]["xaxis"].update(
-            {"tickfont": {"family": "Arial, sans-serif", "size": 13, "color": "black"}}
+        dd = pd.to_numeric(dt["soc"], errors="coerce").astype("float64")
+        palette = pc.qualitative.Plotly
+        fig = make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.06,
+            row_heights=[0.28, 0.36, 0.36],
         )
-        fig["layout"]["yaxis"].update(
-            {
-                "title": "Location",
-                "titlefont": {"size": 12},
-                "showgrid": False,
-                "showline": True,
-                "rangemode": "tozero",
-                "zeroline": True,
-                "domain": [0.75, 1.0],
-                "tickformat":".1%",
-                "tickfont": {
-                    "family": "Arial, sans-serif",
-                    "size": 12,
-                    "color": "black",
-                },
-                "linewidth": 2,
-            }
+        for i, col in enumerate(rr.columns):
+            color = palette[i % len(palette)]
+            fig.add_trace(
+                go.Scatter(
+                    x=rr.index,
+                    y=rr[col],
+                    name=str(col),
+                    mode="lines",
+                    stackgroup="ga_states",
+                    line=dict(width=0.5, color=color),
+                    fillcolor=color,
+                    hovertemplate="%{y:.1%}<extra>%{fullData.name}</extra>",
+                ),
+                row=1,
+                col=1,
+            )
+        fig.add_trace(
+            go.Scatter(
+                x=dk.index,
+                y=pd.to_numeric(dk["consumption"], errors="coerce").astype("float64"),
+                name="consumption",
+                mode="lines",
+                line=dict(color="#636EFA"),
+            ),
+            row=2,
+            col=1,
         )
-        fig["layout"]["yaxis2"].update(
-            {
-                "title": "Grid Availability (kW)",
-                "titlefont": {"size": 12},
-                "showgrid": True,
-                "showline": True,
-                "rangemode": "tozero",
-                "domain": [0.4, 0.7],
-                "tickfont": {
-                    "family": "Arial, sans-serif",
-                    "size": 12,
-                    "color": "black",
-                },
-                "linewidth": 2,
-            }
+        fig.add_trace(
+            go.Scatter(
+                x=dk.index,
+                y=pd.to_numeric(dk["charging_cap"], errors="coerce").astype("float64"),
+                name="charging_cap",
+                mode="lines",
+                line=dict(color="#EF553B"),
+            ),
+            row=2,
+            col=1,
         )
-        fig["layout"]["yaxis3"].update(
-            {
-                "title": "SOC",
-                "titlefont": {"size": 12},
-                "showgrid": True,
-                "showline": True,
-                "rangemode": "tozero",
-                "domain": [0.0, 0.35],
-                "tickformat": ".1%",
-                "tickfont": {
-                    "family": "Arial, sans-serif",
-                    "size": 12,
-                    "color": "black",
-                },
-                "linewidth": 2,
-            }
+        fig.add_trace(
+            go.Scatter(
+                x=dd.index,
+                y=dd,
+                name="soc",
+                mode="lines",
+                line=dict(color="#00CC96"),
+            ),
+            row=3,
+            col=1,
         )
-        fig["layout"].update(
-            {
-                "paper_bgcolor": "white",
-                "plot_bgcolor": "white",
-                "margin": dict(l=10, r=10, t=20, b=10, pad=0),
-            }
-        )  # ,'width': 800,'height': 450,'showlegend': True
-
-        fig = go.Figure(data=fig["data"], layout=fig["layout"])
+        fig.update_xaxes(
+            tickfont=dict(family="Arial, sans-serif", size=13, color="black"),
+            row=3,
+            col=1,
+        )
+        fig.update_yaxes(
+            title=dict(text="Location", font=dict(size=12)),
+            showgrid=False,
+            showline=True,
+            rangemode="tozero",
+            zeroline=True,
+            tickformat=".1%",
+            tickfont=dict(family="Arial, sans-serif", size=12, color="black"),
+            linewidth=2,
+            row=1,
+            col=1,
+        )
+        fig.update_yaxes(
+            title=dict(text="Grid Availability (kW)", font=dict(size=12)),
+            showgrid=True,
+            showline=True,
+            rangemode="tozero",
+            tickfont=dict(family="Arial, sans-serif", size=12, color="black"),
+            linewidth=2,
+            row=2,
+            col=1,
+        )
+        fig.update_yaxes(
+            title=dict(text="SOC", font=dict(size=12)),
+            showgrid=True,
+            showline=True,
+            rangemode="tozero",
+            tickformat=".1%",
+            tickfont=dict(family="Arial, sans-serif", size=12, color="black"),
+            linewidth=2,
+            row=3,
+            col=1,
+        )
+        fig.update_layout(
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            margin=dict(l=10, r=10, t=20, b=10, pad=0),
+        )
         if to_html:
             if path is None:
                 raise Exception(
@@ -255,89 +329,115 @@ class NBplot:
             .fillna(0)
         )
         cn.columns = cn.columns.droplevel()
-        rr = (cn.T / cn.T.sum(axis=0)).T
-        figc = rr.iplot(kind="area", fill=True, asFigure=True)
+        rr = (cn.T / cn.T.sum(axis=0)).T.astype(float)
         dff = dt.pivot_table(
             index=dt.index, columns="option", values="actual_soc", aggfunc="sum"
         )
-        figa = dff.iplot(asFigure=True)
         dg = dt.pivot_table(
             index=dt.index, columns="option", values="charge_grid", aggfunc="sum"
         )
-        figb = dg.iplot(asFigure=True)
-        fig = cf.subplots([figa, figb, figc], shape=(3, 1), shared_xaxes=True)
-        fig["layout"]["xaxis"].update(
-            {"tickfont": {"family": "Arial, sans-serif", "size": 14, "color": "black"}}
+        palette = pc.qualitative.Plotly
+        fig = make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.06,
+            row_heights=[0.32, 0.44, 0.24],
         )
-        fig["layout"]["yaxis"].update(
-            {
-                "title": "SOC",
-                "titlefont": {"size": 14},
-                "showgrid": False,
-                "showline": True,
-                "rangemode": "tozero",
-                "zeroline": True,
-                "domain": [0.7, 1.0],
-                "tickformat": ".1%",
-                "tickfont": {
-                    "family": "Arial, sans-serif",
-                    "size": 14,
-                    "color": "black",
-                },
-                "linewidth": 2,
-            }
+        for i, col in enumerate(dff.columns):
+            color = palette[i % len(palette)]
+            fig.add_trace(
+                go.Scatter(
+                    x=dff.index,
+                    y=pd.to_numeric(dff[col], errors="coerce").astype("float64"),
+                    name="{} (SOC)".format(col),
+                    mode="lines",
+                    line=dict(color=color),
+                ),
+                row=1,
+                col=1,
+            )
+        for i, col in enumerate(dg.columns):
+            color = palette[i % len(palette)]
+            fig.add_trace(
+                go.Scatter(
+                    x=dg.index,
+                    y=pd.to_numeric(dg[col], errors="coerce").astype("float64"),
+                    name="{} (kW)".format(col),
+                    mode="lines",
+                    line=dict(color=color),
+                ),
+                row=2,
+                col=1,
+            )
+        for i, col in enumerate(rr.columns):
+            color = palette[i % len(palette)]
+            fig.add_trace(
+                go.Scatter(
+                    x=rr.index,
+                    y=rr[col],
+                    name=str(col),
+                    mode="lines",
+                    stackgroup="ged_loc",
+                    line=dict(width=0.5, color=color),
+                    fillcolor=color,
+                    hovertemplate="%{y:.1%}<extra>%{fullData.name}</extra>",
+                ),
+                row=3,
+                col=1,
+            )
+        fig.update_xaxes(
+            tickfont=dict(family="Arial, sans-serif", size=14, color="black"),
+            row=3,
+            col=1,
         )
-        fig["layout"]["yaxis2"].update(
-            {
-                "title": "Actual charge (kW)",
-                "titlefont": {"size": 14},
-                "showgrid": True,
-                "showline": True,
-                "rangemode": "tozero",
-                "domain": [0.25, 0.65],
-                "tickfont": {
-                    "family": "Arial, sans-serif",
-                    "size": 12,
-                    "color": "black",
-                },
-                "linewidth": 2,
-            }
+        fig.update_yaxes(
+            title=dict(text="SOC", font=dict(size=14)),
+            showgrid=False,
+            showline=True,
+            rangemode="tozero",
+            zeroline=True,
+            tickformat=".1%",
+            tickfont=dict(family="Arial, sans-serif", size=14, color="black"),
+            linewidth=2,
+            row=1,
+            col=1,
         )
-        fig["layout"]["yaxis3"].update(
-            {
-                "title": "Location",
-                "titlefont": {"size": 14},
-                "showgrid": True,
-                "showline": True,
-                "rangemode": "tozero",
-                "domain": [0.0, 0.2],
-                "tickformat": ".1%",
-                "tickfont": {
-                    "family": "Arial, sans-serif",
-                    "size": 12,
-                    "color": "black",
-                },
-                "linewidth": 2,
-            }
+        fig.update_yaxes(
+            title=dict(text="Actual charge (kW)", font=dict(size=14)),
+            showgrid=True,
+            showline=True,
+            rangemode="tozero",
+            tickfont=dict(family="Arial, sans-serif", size=12, color="black"),
+            linewidth=2,
+            row=2,
+            col=1,
         )
-        fig["layout"].update(
-            {
-                "paper_bgcolor": "white",
-                "plot_bgcolor": "white",
-                "margin": dict(l=10, r=10, t=20, b=10, pad=0),
-                "showlegend": True,
-            }
-        )  # 'width': 800,'height': 450
-
-        FIG = go.Figure(data=fig["data"], layout=fig["layout"])
+        fig.update_yaxes(
+            title=dict(text="Location", font=dict(size=14)),
+            showgrid=True,
+            showline=True,
+            rangemode="tozero",
+            tickformat=".1%",
+            tickfont=dict(family="Arial, sans-serif", size=12, color="black"),
+            linewidth=2,
+            row=3,
+            col=1,
+        )
+        fig.update_layout(
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            margin=dict(l=10, r=10, t=20, b=10, pad=0),
+            showlegend=True,
+        )
         if to_html:
             if path is None:
                 raise Exception(
                     """when to_html is True then path must be given with .html extension"""
                 )
             else:
-                FIG.write_html(file=path)
-        return FIG
+                fig.write_html(file=path)
+        return fig
 
 
     def sankey(self, tscode, include=None, to_html=False, path=None):
@@ -418,8 +518,22 @@ class NBplot:
         dfs = include_weather(ts, cons['refdate'], temp_arr, pres_arr, dp_arr, hum_arr, r_ha)
 
         cdf = self.db.db[consumption_name]['profile'].copy()
-        dfg = pd.merge_asof(dfs, cdf[['datetime', 'speed km/h']], on="datetime", tolerance=pd.Timedelta("900s"),
-                            direction="nearest").fillna(0.0).set_index('datetime')  
+        _mg = pd.merge_asof(
+            dfs,
+            cdf[["datetime", "speed km/h"]],
+            on="datetime",
+            tolerance=pd.Timedelta("900s"),
+            direction="nearest",
+        )
+        for _col in _mg.columns:
+            if _col == "datetime":
+                continue
+            _ser = _mg[_col]
+            if pd.api.types.is_numeric_dtype(_ser):
+                _mg[_col] = _ser.fillna(0.0)
+            else:
+                _mg[_col] = _ser.where(pd.notna(_ser), 0.0)
+        dfg = _mg.set_index("datetime")  
         df = pd.DataFrame()
         availcode = self.db.db[tscode]["input"]
         for k in self.db.db.keys():
@@ -443,99 +557,204 @@ class NBplot:
                 .fillna(0)
         )
         cn.columns = cn.columns.droplevel()
-        rr = (cn.T / cn.T.sum(axis=0)).T
+        rr = (cn.T / cn.T.sum(axis=0)).T.astype(float)
 
         # imput is the name of grid demand time series (charging class) and database 'db'
         # rr, dfg, dff, dg are dataframes resulting from a preprocessing step
 
-        fig1 = rr[start:end].iplot(kind="area", fill=True, asFigure=True)
-        fig2 = dfg[start:end][["distance", "consumption"]].iplot(colors=['green', 'pink'], asFigure=True)
-        fig3 = dfg[start:end][["temp_degC", "speed km/h"]].iplot(colors=['purple', '#9c8830'], asFigure=True)
-        fig4 = dg[start:end].iplot(yTitle='Power rating (kW)', asFigure=True)
-        fig5 = dff[start:end].iplot(yTitle='SOC', asFigure=True)
+        rr_s = rr.loc[start:end]
+        dfg_s = dfg.loc[start:end]
+        dg_s = dg.loc[start:end]
+        dff_s = dff.loc[start:end]
 
-        for trace in fig5['data']:
-            trace['showlegend'] = True
+        palette = pc.qualitative.Plotly
+        fig = make_subplots(
+            rows=5,
+            cols=1,
+            shared_xaxes=True if share_x else False,
+            vertical_spacing=0.04,
+            specs=[[{"secondary_y": True}] for _ in range(5)],
+        )
 
-        fig = make_subplots(rows=5, cols=1,shared_xaxes= True if share_x else False,
-                            specs=[[{"secondary_y": True}], [{'secondary_y': True}], [{'secondary_y': True}],
-                                [{'secondary_y': True}], [{'secondary_y': True}]])
+        for i, col in enumerate(rr_s.columns):
+            color = palette[i % len(palette)]
+            fig.add_trace(
+                go.Scatter(
+                    x=rr_s.index,
+                    y=rr_s[col],
+                    name=str(col),
+                    mode="lines",
+                    stackgroup="ov_row1",
+                    line=dict(width=0.6, color=color),
+                    fillcolor=color,
+                    hovertemplate="%{y:.1%}<extra>%{fullData.name}</extra>",
+                ),
+                row=1,
+                col=1,
+                secondary_y=False,
+            )
 
-        [fig.add_trace(trace, secondary_y=False, row=1, col=1) for trace in fig1['data']]
-        fig.add_trace(fig2['data'][0], secondary_y=False, row=2, col=1)
-        fig.add_trace(fig2['data'][1], secondary_y=True, row=2, col=1)
-        fig.add_trace(fig3['data'][0], secondary_y=False, row=3, col=1)
-        fig.add_trace(fig3['data'][1], secondary_y=True, row=3, col=1)
-        [fig.add_trace(trace, secondary_y=False, row=4, col=1) for trace in fig4['data']]
-        [fig.add_trace(trace, secondary_y=False, row=5, col=1) for trace in fig5['data']]
+        fig.add_trace(
+            go.Scatter(
+                x=dfg_s.index,
+                y=pd.to_numeric(dfg_s["distance"], errors="coerce").astype("float64"),
+                name="Distance",
+                mode="lines",
+                line=dict(color="green", width=2.2),
+            ),
+            row=2,
+            col=1,
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=dfg_s.index,
+                y=pd.to_numeric(dfg_s["consumption"], errors="coerce").astype("float64"),
+                name="Consumption",
+                mode="lines",
+                line=dict(color="pink", width=1.2),
+            ),
+            row=2,
+            col=1,
+            secondary_y=True,
+        )
 
-        renames = {'distance': ('Distance', 2.2),
-                    'consumption': ('Consumption', 1.2),
-                    'temp_degC': ('Temperature', 2),
-                    'speed km/h': ('Average speed', 2),
-                #    'from_23_to_8_at_any': ('Charge at night', 2),
-                #    'immediate': ('Charge immediate', 1.5),
-                #    'home': ('Home', 0.6), 'driving': ('Driving', 0.6), 'workplace': ('Workplace', 0.6),
-                #    'errands': ('Errands', 0.6), 'leisure': ('Leisure', 0.6), 'shopping': ('Shopping', 0.6),
-                    }
+        fig.add_trace(
+            go.Scatter(
+                x=dfg_s.index,
+                y=pd.to_numeric(dfg_s["temp_degC"], errors="coerce").astype("float64"),
+                name="Temperature",
+                mode="lines",
+                line=dict(color="purple", width=2),
+            ),
+            row=3,
+            col=1,
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=dfg_s.index,
+                y=pd.to_numeric(dfg_s["speed km/h"], errors="coerce").astype("float64"),
+                name="Average speed",
+                mode="lines",
+                line=dict(color="#9c8830", width=2),
+            ),
+            row=3,
+            col=1,
+            secondary_y=True,
+        )
 
-        for trace in fig['data']:
-            if trace['name'] in renames:
-                name = trace['name']
-                trace['name'] = renames[name][0]
-                trace['line']['width'] = renames[name][1]
-            else:
-                trace['line']['width'] = 0.6
+        for i, col in enumerate(dg_s.columns):
+            color = palette[i % len(palette)]
+            fig.add_trace(
+                go.Scatter(
+                    x=dg_s.index,
+                    y=pd.to_numeric(dg_s[col], errors="coerce").astype("float64"),
+                    name=str(col),
+                    mode="lines",
+                    line=dict(width=0.6, color=color),
+                ),
+                row=4,
+                col=1,
+                secondary_y=False,
+            )
 
-        fig["layout"].update({'yaxis': dict(title="Location", 
-                                            title_font=dict(color='black',
-                                                            # size=18,
-                                                            ), 
-                                            showgrid=False,
-                                            zeroline=True, linecolor='black', gridcolor='#bdbdbd', tickformat=".1%",
-                                            # tickfont={"size": 12},
-                                            ),
-                                'yaxis3': dict(title='Distance (km)', 
-                                            title_font=dict(color='green',
-                                                            # size=18,
-                                                            ),
-                                            showgrid=True, zeroline=True, linecolor='black', gridcolor='#bdbdbd',
-                                            #  tickfont={"size": 12},
-                                            ),
-                                'yaxis4': dict(title='Consumption (kWh)', 
-                                            title_font=dict(color='pink'
-                                                            # size=18, 
-                                                            ),
-                                            showgrid=False, zeroline=True, linecolor='black', gridcolor='#bdbdbd',
-                                            #  tickfont={"size": 12},
-                                            ),
-                                'yaxis5': dict(title='Temp (C)', 
-                                            title_font=dict(color='purple',
-                                                            #  size=18,
-                                                            ),
-                                            showgrid=True, zeroline=True, linecolor='black', gridcolor='#bdbdbd',
-                                            zerolinecolor='black', 
-                                            #  tickfont={"size": 12},
-                                            ),
-                                'yaxis6': dict(title='Speed (km/h)', title_font=dict(color='#9c8830'
-                                                                                #   size=18, 
-                                                                                    ),
-                                            showgrid=False, zeroline=True, linecolor='black', gridcolor='#bdbdbd',
-                                            #  tickfont={"size": 12},
-                                            ),
-                                'yaxis7': dict(title='Power rating (kW)', title_font=dict(color='black',
-                                                                                    #   size=18, 
-                                                                                        ),
-                                            showgrid=True, zeroline=True, linecolor='black', gridcolor='#bdbdbd',
-                                            #  tickfont={"size": 12},
-                                            ),
-                                'yaxis9': dict(title='SOC', title_font=dict(color='black',
-                                                                        #   size=18,
-                                                                        ), 
-                                            showgrid=True, zeroline=True, linecolor='black', gridcolor='#bdbdbd', tickformat=".1%",
-                                            #  tickfont={"size": 12},
-                                            ),
-                                            })
+        for i, col in enumerate(dff_s.columns):
+            color = palette[i % len(palette)]
+            fig.add_trace(
+                go.Scatter(
+                    x=dff_s.index,
+                    y=pd.to_numeric(dff_s[col], errors="coerce").astype("float64"),
+                    name=str(col),
+                    mode="lines",
+                    line=dict(width=0.6, color=color),
+                    showlegend=True,
+                ),
+                row=5,
+                col=1,
+                secondary_y=False,
+            )
+
+        fig.update_yaxes(
+            title=dict(text="Location", font=dict(color="black")),
+            showgrid=False,
+            zeroline=True,
+            linecolor="black",
+            gridcolor="#bdbdbd",
+            tickformat=".1%",
+            rangemode="tozero",
+            row=1,
+            col=1,
+            secondary_y=False,
+        )
+        fig.update_yaxes(
+            title=dict(text="Distance (km)", font=dict(color="green")),
+            showgrid=True,
+            zeroline=True,
+            linecolor="black",
+            gridcolor="#bdbdbd",
+            rangemode="tozero",
+            row=2,
+            col=1,
+            secondary_y=False,
+        )
+        fig.update_yaxes(
+            title=dict(text="Consumption (kWh)", font=dict(color="pink")),
+            showgrid=False,
+            zeroline=True,
+            linecolor="black",
+            gridcolor="#bdbdbd",
+            rangemode="tozero",
+            row=2,
+            col=1,
+            secondary_y=True,
+        )
+        fig.update_yaxes(
+            title=dict(text="Temp (C)", font=dict(color="purple")),
+            showgrid=True,
+            zeroline=True,
+            linecolor="black",
+            gridcolor="#bdbdbd",
+            zerolinecolor="black",
+            rangemode="tozero",
+            row=3,
+            col=1,
+            secondary_y=False,
+        )
+        fig.update_yaxes(
+            title=dict(text="Speed (km/h)", font=dict(color="#9c8830")),
+            showgrid=False,
+            zeroline=True,
+            linecolor="black",
+            gridcolor="#bdbdbd",
+            rangemode="tozero",
+            row=3,
+            col=1,
+            secondary_y=True,
+        )
+        fig.update_yaxes(
+            title=dict(text="Power rating (kW)", font=dict(color="black")),
+            showgrid=True,
+            zeroline=True,
+            linecolor="black",
+            gridcolor="#bdbdbd",
+            rangemode="tozero",
+            row=4,
+            col=1,
+            secondary_y=False,
+        )
+        fig.update_yaxes(
+            title=dict(text="SOC", font=dict(color="black")),
+            showgrid=True,
+            zeroline=True,
+            linecolor="black",
+            gridcolor="#bdbdbd",
+            tickformat=".1%",
+            rangemode="tozero",
+            row=5,
+            col=1,
+            secondary_y=False,
+        )
 
         fig.update_xaxes(showgrid=True, zeroline=True, linecolor='black', gridcolor='#bdbdbd')
         fig.update_yaxes(rangemode='tozero')

@@ -495,6 +495,97 @@ def resistances(zone_layer, zone_area, layer_conductivity, layer_thickness,
     return R_z.sum()
 
 
+@numba.jit(nopython=True)
+def _density_ideal_gas_numba(T_C, P_mbar):
+    """Luftdichte nach Idealgasgesetz [kg/m³]; T_C in °C, P_mbar in mbar."""
+    return (100.0 * P_mbar) / (287.05 * (T_C + 273.15))
+
+
+@numba.jit(nopython=True)
+def qhvac_numba(
+    T_out,
+    T_targ,
+    cabin_volume,
+    flow_air,
+    zone_layer,
+    zone_area,
+    layer_conductivity,
+    layer_thickness,
+    vehicle_speed,
+    Q_sensible=70.0,
+    persons=1.0,
+    P_out=1013.25,
+    air_cabin_heat_transfer_coef=10.0,
+):
+    """
+    Numba-beschleunigte HVAC-Wärmelast mit Idealgas-Dichte (wie qhvac, aber ohne D-Callable).
+    Q[:, 0] = Qtotal; weitere Spalten wie in qhvac.
+    """
+    n = vehicle_speed.shape[0]
+    T = np.zeros(n)
+    Q = np.zeros((n, 8))
+    if T_targ is None or (T_targ != T_targ):
+        return Q, T
+    t_diff = T_out - T_targ
+    if t_diff > 0:
+        plus = -0.05
+        sign = -1
+    else:
+        plus = 0.05
+        sign = 1
+
+    rho_out = _density_ideal_gas_numba(T_out, P_out)
+    mass_flow_in = flow_air * rho_out
+    cp_out = cp(T_out)
+
+    for tm in range(n):
+        if tm == 0:
+            t_1 = T_out
+            t = T_out + plus
+        else:
+            t_1 = T[tm - 1]
+            if sign == -1:
+                if np.round(t, 2) > T_targ:
+                    t += plus
+                else:
+                    t = T_targ
+            else:
+                if np.round(t, 2) < T_targ:
+                    t += plus
+                else:
+                    t = T_targ
+
+        Q_in_per = q_person(Q_sensible, persons)
+        Q[tm, 1] = Q_in_per
+        Q_in_vent = q_ventilation(rho_out, flow_air, cp_out, T_out)
+        Q[tm, 2] = Q_in_vent
+        rho_t = _density_ideal_gas_numba(t, P_out)
+        cp_t = cp(t)
+        Q_out_vent = q_ventilation(
+            rho_t, mass_flow_in / rho_t, cp_t, t
+        )
+        Q[tm, 3] = Q_out_vent
+        Q_tr = q_transfer(
+            zone_layer, zone_area, layer_conductivity,
+            layer_thickness, t, T_out, vehicle_speed[tm],
+            air_cabin_heat_transfer_coef,
+        )
+        Q[tm, 4] = Q_tr
+        Q[tm, 0] = (
+            cabin_volume * rho_t * cp_t * (t - t_1)
+            - Q_in_per - Q[tm, 2] + Q_out_vent + Q_tr
+        )
+        T[tm] = t
+        Q[tm, 5] = rho_out
+        Q[tm, 6] = rho_t
+        Q[tm, 7] = resistances(
+            zone_layer, zone_area, layer_conductivity,
+            layer_thickness, vehicle_speed[tm],
+            air_cabin_heat_transfer_coef,
+        )
+    return Q, T
+
+
 # @numba.jit(nopython=True)
 def qhvac(D,
           T_out,

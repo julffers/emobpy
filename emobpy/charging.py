@@ -138,11 +138,13 @@ class Charging:
                 self._clean()
                 return None
             self.numpy_array3 = self.profile[['state']].values.T
-            self.arraystringstate = self.numpy_array3[0]
+            self.arraystringstate = self.numpy_array3[0].astype(str)
             self.arraycodestate = np.array([self.states.index(s) for s in self.arraystringstate])
             self.numpy_array2 = self.profile[['consumption', 'charging_cap']].values.T
+            self.arrayconsumption = self.numpy_array2[0].astype(np.float64)
+            self.arraychargingcap = self.numpy_array2[1].astype(np.float64)
             self.results = self._immediate(self.pointcode, self.charging_eff, self.battery_capacity, self.soc_init,
-                                           self.arraycodestate, *self.numpy_array2, self.t)
+                                           self.arraycodestate, self.arrayconsumption, self.arraychargingcap, self.t)
             self.profile.loc[:, 'actual_soc'] = self.results[0]
             self.profile.loc[:, 'charge_battery'] = self.results[1]
             self.profile.loc[:, 'charge_grid'] = self.results[2]
@@ -157,7 +159,7 @@ class Charging:
                 self._clean()
                 return None
             self.numpy_array3 = self.profile[['state', 'consumption', 'charging_cap']].values.T
-            self.arraystringstate = self.numpy_array3[0]
+            self.arraystringstate = self.numpy_array3[0].astype(str)
             self.arraycodestate = np.array([self.states.index(s) for s in self.arraystringstate])
             self.arrayconsumption = self.numpy_array3[1].astype(np.float64)
             self.arraychargingcap = self.numpy_array3[2].astype(np.float64)
@@ -173,7 +175,7 @@ class Charging:
             self.point = self.op_list[5]
 
             self.numpy_array4 = self.profile[['state', 'consumption', 'charging_cap', 'hh']].values.T
-            self.arraystringstate = self.numpy_array4[0]
+            self.arraystringstate = self.numpy_array4[0].astype(str)
             self.arraycodestate = np.array([self.states.index(s) for s in self.arraystringstate])
             try:
                 self.drivingcode = self.states.index('driving')

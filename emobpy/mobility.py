@@ -924,20 +924,20 @@ class Mobility:
         self.timeseries = pd.DataFrame(columns=self.db.columns)
         self.timeseries.loc[:, "hh"] = np.arange(0, self.hours, self.t)
 
-        # Start New version, which works for 1s-based profiles:
-        temp_timeseries = [round(num * 3600) for num in self.timeseries["hh"]]
-        temp_db = [round(num * 3600) for num in self.db["hr"]]
-        temp_intersection_list = list(set(temp_timeseries).intersection(temp_db))
-
-        self.idx = []
-        for i in temp_intersection_list:
-            self.idx.append(temp_timeseries.index(i))
-        self.idx = np.sort(self.idx).tolist() # values might be unsorted -> sort
+        # Start New version, which works for 1s-based profiles (vectorized):
+        temp_ts = np.round(self.timeseries["hh"].values * 3600).astype(np.int64)
+        temp_db = np.round(self.db["hr"].values * 3600).astype(np.int64)
+        order = np.argsort(temp_ts)
+        sorted_ts = temp_ts[order]
+        pos = np.searchsorted(sorted_ts, temp_db)
+        idx = order[pos]
+        sorted_by_idx = np.argsort(idx)
+        self.idx = idx[sorted_by_idx].tolist()
         # End new version
 
         self.mixed = self.repeats_float + self.repeats_str + self.copied
         for r in self.mixed:
-            self.val = self.db[r].values.tolist()
+            self.val = self.db[r].values[sorted_by_idx]
             self.timeseries.loc[self.idx, r] = self.val
         self.timeseries.loc[self.totalrows - 1, "state"] = self.db["state"].iloc[-1]
         self.timeseries.loc[self.totalrows - 1, "hr"] = self.timeseries["hh"][self.totalrows - 1]
@@ -1034,7 +1034,17 @@ class Mobility:
         self.prev_dest = self.initial_state  # it is the first state at the beginning of the profile
 
         self.total_days = int(self.hours / 24)
-        self.profile = pd.DataFrame()
+        hr_list = []
+        state_list = []
+        departure_list = []
+        arrival_list = []
+        last_arrival_list = []
+        purpose_list = []
+        duration_list = []
+        weekday_list = []
+        category_list = []
+        distance_list = []
+        trip_duration_list = []
         endflag = False
         lastflag = False
         for _ in range(self.numb_weeks):
@@ -1046,51 +1056,73 @@ class Mobility:
                 self._select_tour()
                 self.prev_dest = copy.deepcopy(self.prev_dst)
                 if not self.no_trip:
-                    for _, row in self.tour.iterrows():
-                        self.hr = row["departure"] + self.days * 24.0 - self.t
+                    for row in self.tour.itertuples(index=False):
+                        self.hr = row.departure + self.days * 24.0 - self.t
                         if self.hr == self.hours - self.t:
-                            self.profile.loc[self.hr, "hr"] = self.hr
-                            self.profile.loc[self.hr, "state"] = row["state"]
-                            self.profile.loc[self.hr, "departure"] = row["departure"]
-                            self.profile.loc[self.hr, "arrival"] = row["arrival"]
-                            self.profile.loc[self.hr, "last_arrival"] = row["last_arrival"]
-                            self.profile.loc[self.hr, "purpose"] = row["purpose"]
-                            self.profile.loc[self.hr, "duration"] = row["duration"]
-                            self.profile.loc[self.hr, "weekday"] = self.weeks[self.n_day]["day"]
-                            self.profile.loc[self.hr, "category"] = self.user_defined
-                            self.profile.loc[self.hr, "distance"] = 0
-                            self.profile.loc[self.hr, "trip_duration"] = 0
+                            hr_list.append(self.hr)
+                            state_list.append(row.state)
+                            departure_list.append(row.departure)
+                            arrival_list.append(row.arrival)
+                            last_arrival_list.append(row.last_arrival)
+                            purpose_list.append(row.purpose)
+                            duration_list.append(row.duration)
+                            weekday_list.append(self.weeks[self.n_day]["day"])
+                            category_list.append(self.user_defined)
+                            distance_list.append(0)
+                            trip_duration_list.append(0)
                             endflag = True
                             break
                         elif self.hr > self.hours - self.t:
                             endflag = True
                             break
                         elif self.hr < self.hours - self.t:
-                            self.profile.loc[self.hr, "hr"] = self.hr
-                            self.profile.loc[self.hr, "state"] = row["state"]
-                            self.profile.loc[self.hr, "departure"] = row["departure"]
-                            self.profile.loc[self.hr, "arrival"] = row["arrival"]
-                            self.profile.loc[self.hr, "last_arrival"] = row["last_arrival"]
-                            self.profile.loc[self.hr, "purpose"] = row["purpose"]
-                            self.profile.loc[self.hr, "duration"] = row["duration"]
-                            self.profile.loc[self.hr, "weekday"] = self.weeks[self.n_day]["day"]
-                            self.profile.loc[self.hr, "category"] = self.user_defined
-                            self.profile.loc[self.hr, "distance"] = 0
-                            self.profile.loc[self.hr, "trip_duration"] = 0
-                            # if (self.hr + row["timesteps"] * self.t) > self.hours - self.t:
-                            #     endflag = True
-                            #     break
-                            # add driving in next row
-                            self.profile.loc[self.hr + row["timesteps"] * self.t, "hr"] = (self.hr + row["timesteps"] * self.t)
-                            self.profile.loc[self.hr + row["timesteps"] * self.t, "state"] = "driving"
-                            self.profile.loc[self.hr + row["timesteps"] * self.t, "distance"] = row["distance"]
-                            self.profile.loc[self.hr + row["timesteps"] * self.t, "trip_duration"] = row["trip_duration"]
+                            hr_list.append(self.hr)
+                            state_list.append(row.state)
+                            departure_list.append(row.departure)
+                            arrival_list.append(row.arrival)
+                            last_arrival_list.append(row.last_arrival)
+                            purpose_list.append(row.purpose)
+                            duration_list.append(row.duration)
+                            weekday_list.append(self.weeks[self.n_day]["day"])
+                            category_list.append(self.user_defined)
+                            distance_list.append(0)
+                            trip_duration_list.append(0)
+                            hr_drive = self.hr + row.timesteps * self.t
+                            hr_list.append(hr_drive)
+                            state_list.append("driving")
+                            departure_list.append(np.nan)
+                            arrival_list.append(np.nan)
+                            last_arrival_list.append(np.nan)
+                            purpose_list.append(np.nan)
+                            duration_list.append(np.nan)
+                            weekday_list.append(np.nan)
+                            category_list.append(np.nan)
+                            distance_list.append(row.distance)
+                            trip_duration_list.append(row.trip_duration)
                 if endflag:
                     lastflag = True
                     break
             if lastflag:
                 break
         print("")
+        if hr_list:
+            self.profile = pd.DataFrame({
+                "hr": hr_list,
+                "state": state_list,
+                "departure": departure_list,
+                "arrival": arrival_list,
+                "last_arrival": last_arrival_list,
+                "purpose": purpose_list,
+                "duration": duration_list,
+                "weekday": weekday_list,
+                "category": category_list,
+                "distance": distance_list,
+                "trip_duration": trip_duration_list,
+            })
+            self.profile.set_index("hr", inplace=True)
+            self.profile["hr"] = self.profile.index  # Spalte für _fill_rows (db["hr"])
+        else:
+            self.profile = pd.DataFrame()
         if not self.profile.empty:
             if self.profile["state"].iloc[-1] == "driving":
                 # remove the last row self.profile

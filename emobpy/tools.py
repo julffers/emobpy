@@ -96,39 +96,48 @@ def cmp(arg1, string_operator, arg2):
     operation = ops.get(string_operator)
     return operation(arg1, arg2)
 
+# Progress-Bar-Throttling: nur alle N Schritte ausgeben (weniger I/O, schneller)
+_MOBILITY_PROGRESS_STEP = 7   # Tage
+_CONSUMPTION_PROGRESS_STEP = 10  # Trips
+
+
 def mobility_progress_bar(current, total):
     """
     Prints actual progress in format: "Progress: 80% [8 / 10] days".
+    Updates only every _MOBILITY_PROGRESS_STEP days or on completion to reduce I/O.
 
     Args:
         current (int): Current day.
         total (int): Total number of days.
     """
+    if current == total or current % _MOBILITY_PROGRESS_STEP == 0 or current == 1:
+        progress_message = "Progress: %d%% [%d / %d] days" % (
+            current * 100 // total if total else 0,
+            current,
+            total,
+        )
+        sys.stdout.write("\r" + progress_message)
+        sys.stdout.flush()
 
-    progress_message = "Progress: %d%% [%d / %d] days" % (
-        current / total * 100,
-        current,
-        total,
-    )
-    sys.stdout.write("\r" + progress_message)
-    sys.stdout.flush()
 
 def consumption_progress_bar(current, total):
     """
     Prints message about consumption progress.
+    Updates only every _CONSUMPTION_PROGRESS_STEP trips or on completion to reduce I/O.
 
     Args:
         current (int): Current index.
         total (int): Total number of loops.
         width (int, optional): Not used. Defaults to 80.
     """
-    progress_message = "Progress: %d%% [%d / %d] trips" % (
-        current / total * 100,
-        current,
-        total,
-    )
-    sys.stdout.write("\r" + progress_message)
-    sys.stdout.flush()
+    if current == total or current % _CONSUMPTION_PROGRESS_STEP == 0 or current == 1:
+        progress_message = "Progress: %d%% [%d / %d] trips" % (
+            current * 100 // total if total else 0,
+            current,
+            total,
+        )
+        sys.stdout.write("\r" + progress_message)
+        sys.stdout.flush()
     
 def wget_progress_bar(*args):
     """

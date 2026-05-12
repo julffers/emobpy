@@ -76,7 +76,7 @@ from .functions import (
     p_generatorin,
     p_motorin,
     p_generatorout,
-    qhvac
+    qhvac_numba,
 )
 from .tools import (Unit, check_for_new_function_name, _add_column_datetime, consumption_progress_bar, wget_progress_bar, display_all)
 from .init import copy_to_user_data_dir
@@ -396,8 +396,7 @@ class BEVspecs:
         print_dict = json.loads(json.dumps(self.data))
         print_dict.pop('fallback_parameters')
 
-        df = pd.DataFrame(columns=['brand', 'model', 'year', 'value', 'unit'])
-
+        rows = []
         for brand_name, brand_values in self.data.items():
             if brand_name == 'fallback_parameters':
                 continue
@@ -411,9 +410,16 @@ class BEVspecs:
                         continue
                     for para_name, para_value in year_values.items():
                         if para_name == parameter:
-                            df = df.append(
-                                {'brand': brand_name, 'model': model_name, 'year': year_name, 'value': para_value["value"], 'unit': para_value['unit']},
-                                ignore_index=True)
+                            rows.append(
+                                {
+                                    "brand": brand_name,
+                                    "model": model_name,
+                                    "year": year_name,
+                                    "value": para_value["value"],
+                                    "unit": para_value["unit"],
+                                }
+                            )
+        df = pd.DataFrame(rows, columns=["brand", "model", "year", "value", "unit"])
         logger.info(f'Parameter: {parameter}')
         data = df.sort_values(by='value', ascending=False).reset_index(drop=True)
         logger.info(data.head(first_x))
@@ -880,7 +886,9 @@ class DrivingCycle:
         self.index_speed = None
         user_dir = USER_PATH or DEFAULT_DATA_DIR
         self.datafile = os.path.join(user_dir, DC_FILE)
-        # self.load_data()
+        # Cache (index, scale, slide, mean_speed_m_s) -> (speed_array, acc_array) für gleiche Trips
+        self._cycle_cache = {}
+        self._cycle_cache_max_size = 500
 
     def __getattr__(self, item):
         check_for_new_function_name(item)
@@ -1091,32 +1099,37 @@ class DrivingCycle:
         trip.time["value"] = np.ceil(Unit(trip._duration["value"], trip._duration["unit"]).convert_to("s").val)
         trip.time["unit"] = "s"
 
-        scale = (trip.time["value"]
-                // Unit(self.data[trip.index]["time"]["value"], self.data[trip.index]["time"]["unit"]).convert_to("s").val
-        )
-        slide = (
-                trip.time["value"]
-                % Unit(self.data[trip.index]["time"]["value"], self.data[trip.index]["time"]["unit"]).convert_to("s").val
-        )
-        normalized = self.data[trip.index]["normalized"]["value"]
-        normalized_array = np.array(list(normalized) * int(scale) + list(normalized)[0: int(slide)])
-        speed_array = (
-                normalized_array
-                * Unit(trip._mean_speed["value"], trip._mean_speed["unit"]).convert_to("m/s").val
-        )
-        i = 0
-        for last_secs in range(-20, 0):
-            i += 1
-            calc = (
-                    speed_array[last_secs - 1] - speed_array[last_secs - 1] * (i / 100) * 2
-            )
-            speed_array[last_secs] = max(0, calc)
+        cycle_time_s = Unit(self.data[trip.index]["time"]["value"], self.data[trip.index]["time"]["unit"]).convert_to("s").val
+        scale = int(trip.time["value"] // cycle_time_s)
+        slide = int(trip.time["value"] % cycle_time_s)
+        mean_speed_m_s = Unit(trip._mean_speed["value"], trip._mean_speed["unit"]).convert_to("m/s").val
 
-        trip.speed["value"] = speed_array
+        cache_key = (trip.index, scale, slide, round(mean_speed_m_s, 6))
+        if cache_key in self._cycle_cache:
+            speed_array, acc_array = self._cycle_cache[cache_key]
+            trip.speed["value"] = speed_array.copy()
+            trip.acceleration["value"] = acc_array.copy()
+        else:
+            normalized = self.data[trip.index]["normalized"]["value"]
+            normalized_array = np.array(list(normalized) * scale + list(normalized)[0: slide])
+            speed_array = normalized_array * mean_speed_m_s
+            i = 0
+            for last_secs in range(-20, 0):
+                i += 1
+                calc = (
+                        speed_array[last_secs - 1] - speed_array[last_secs - 1] * (i / 100) * 2
+                )
+                speed_array[last_secs] = max(0, calc)
+
+            acc_array = acceleration_array(speed_array)
+            if len(self._cycle_cache) < self._cycle_cache_max_size:
+                self._cycle_cache[cache_key] = (speed_array.copy(), acc_array.copy())
+
+            trip.speed["value"] = speed_array
+            trip.acceleration["value"] = acc_array
+
         trip.speed["unit"] = "m/s"
-        trip.acceleration["value"] = acceleration_array(speed_array)
         trip.acceleration["unit"] = "m/s**2"
-
         trip.driving_cycle_name = self.data[trip.index]["name"]
 
 
@@ -1561,7 +1574,6 @@ class Consumption:
         self.profile.loc[:, "road_type"] = road_type
 
         wt = Weather()
-        D = wt.humidair_density
         temp_arr = wt.temp(weather_country, weather_year)
         pres_arr = wt.pressure(weather_country, weather_year)
         dp_arr = wt.dewpoint(weather_country, weather_year)
@@ -1575,337 +1587,354 @@ class Consumption:
         self.Trips = Trips()
         dc = DrivingCycle()
         dc.load_data()
-        total = len(self.profile[self.profile["state"] == "driving"])
-        current = 1
+        driving_indices = self.profile.index[self.profile["state"] == "driving"].tolist()
+        total = len(driving_indices)
+        # Listen für Bulk-Zuweisung am Ende (weniger .loc-Overhead)
+        rate_list = []
+        consumption_list = []
+        P_bat_t_list = []
+        P_gen_bat_dischg_t_list = []
+        P_aux_t_list = []
+        P_hvac_t_list = []
+        P_m_in_t_list = []
+        P_m_o_t_list = []
+        P_wheel_pos_list = []
+        rol_pos_list = []
+        air_pos_list = []
+        gra_pos_list = []
+        acc_pos_list = []
+        trip_codes_list = []
 
-        for i, row in self.profile.iterrows():
-            if row["state"] == "driving":
-                consumption_progress_bar(current, total)
-                current += 1
-                trip = Trip(self.Trips)
-                trip.driving_cycle_type = driving_cycle_type
-                trip.add_distance_duration(
-                    distance={"value": row["distance"], "unit": "km"},
-                    duration={"value": row["trip_duration"], "unit": "min"},
-                )
-                dc.driving_cycle(trip, self.vehicle, full_driving_cycle=False)
-                v = trip.speed["value"]  # m/s
-                acc = trip.acceleration["value"]  # m/s2
-                targ_temp, cop, ret = self._cop_and_target_temp(row["temp_degC"])
-                frontal_area = self.vehicle.parameters["front_area"]
-                P_max = (
-                        self.vehicle.parameters["power"] * 1000
-                )  # kW to W
-                f_d = self.vehicle.parameters["drag_coeff"]
-                f_r = rolling_resistance_coeff(
-                    method="M1",
-                    temp=row["temp_degC"],
-                    v=v * 3.6,
-                    road_type=row["road_type"],
-                )
-                # f_r = rolling_resistance_coeff(method='M2', v=v*3.6, tire_type=0, road_type=4)
-                m_i = self.vehicle.parameters["inertial_mass"]
-                m_c = self.vehicle.parameters["curb_weight"]
-                m_v = vehicle_mass(m_c, passenger_mass * passenger_nr)
-                P_rol = prollingresistance(f_r, m_v, GRAVITY, v)
-                P_air = pairdrag(
-                    row["air_density_kg/m3"], frontal_area, f_d, v, row["wind_m/s"]
-                )  # last arg is wind speed
-                P_g = p_gravity(
-                    m_v, GRAVITY, v, row["slope_rad"]
-                )  # last arg is road slope
-                P_ine = pinertia(m_i, m_v, acc, v)
-                P_wheel = p_wheel(P_rol, P_air, P_g, P_ine)
-                P_m_o = p_motorout(P_wheel, self.transmission_eff)
-                n_rb = EFFICIENCYregenerative_braking(acc)
-                P_gen_in = p_generatorin(P_wheel, self.transmission_eff, n_rb)
-                Load_p_m = P_m_o / P_max
-                Load_p_g = P_gen_in / P_max
-                n_mot = self.η.get_efficiency(Load_p_m, 1)
-                n_gen = self.η.get_efficiency(Load_p_g, -1)
-                P_m_in = p_motorin(P_m_o, n_mot)
-                P_g_out = p_generatorout(P_gen_in, n_gen)
-                P_aux = np.array([self.auxiliary_power] * len(v))
-                Q_hvac, Tcabin = qhvac(
-                    D,
-                    row["temp_degC"],
-                    targ_temp,
-                    self.cabin_volume,
-                    air_flow,
-                    heat_insulation.zone_layers_,
-                    heat_insulation.zone_surface_,
-                    heat_insulation.layer_conductivity_,
-                    heat_insulation.layer_thickness_,
-                    v,
-                    Q_sensible=passenger_sensible_heat,
-                    persons=passenger_nr,
-                    air_cabin_heat_transfer_coef=air_cabin_heat_transfer_coef,
-                )
-                P_hvac = np.abs(Q_hvac[:, 0]) / cop
-                P_gen_bat_charg = P_g_out * self.battery_charge_eff * -1
-                P_bat = (P_m_in + P_aux + P_hvac) / self.battery_discharge_eff
-                # section to calculate consumption
-                P_all = P_m_in + P_aux + P_hvac + P_g_out
-                P_all_negative = P_all.copy()
-                P_all_negative[P_all_negative > 0.0] = 0.0
-                P_all_positive = P_all.copy()
-                P_all_positive[P_all_positive < 0.0] = 0.0
-                P_bat_chg = P_all_negative * self.battery_charge_eff
-                P_bat_dischg = P_all_positive / self.battery_discharge_eff
-                P_bat_actual = np.add(P_bat_dischg, P_bat_chg)  # W
-                consumption = P_bat_actual.sum() / 1000 / 3600  # kWh
-                rate = consumption / v.sum() * 100000  # kWh/100 km
+        for current, i in enumerate(driving_indices, 1):
+            consumption_progress_bar(current, total)
+            row = self.profile.loc[i]
+            trip = Trip(self.Trips)
+            trip.driving_cycle_type = driving_cycle_type
+            trip.add_distance_duration(
+                distance={"value": row["distance"], "unit": "km"},
+                duration={"value": row["trip_duration"], "unit": "min"},
+            )
+            dc.driving_cycle(trip, self.vehicle, full_driving_cycle=False)
+            v = trip.speed["value"]  # m/s
+            acc = trip.acceleration["value"]  # m/s2
+            targ_temp, cop, ret = self._cop_and_target_temp(row["temp_degC"])
+            frontal_area = self.vehicle.parameters["front_area"]
+            P_max = (
+                    self.vehicle.parameters["power"] * 1000
+            )  # kW to W
+            f_d = self.vehicle.parameters["drag_coeff"]
+            f_r = rolling_resistance_coeff(
+                method="M1",
+                temp=row["temp_degC"],
+                v=v * 3.6,
+                road_type=row["road_type"],
+            )
+            m_i = self.vehicle.parameters["inertial_mass"]
+            m_c = self.vehicle.parameters["curb_weight"]
+            m_v = vehicle_mass(m_c, passenger_mass * passenger_nr)
+            P_rol = prollingresistance(f_r, m_v, GRAVITY, v)
+            P_air = pairdrag(
+                row["air_density_kg/m3"], frontal_area, f_d, v, row["wind_m/s"]
+            )
+            P_g = p_gravity(
+                m_v, GRAVITY, v, row["slope_rad"]
+            )
+            P_ine = pinertia(m_i, m_v, acc, v)
+            P_wheel = p_wheel(P_rol, P_air, P_g, P_ine)
+            P_m_o = p_motorout(P_wheel, self.transmission_eff)
+            n_rb = EFFICIENCYregenerative_braking(acc)
+            P_gen_in = p_generatorin(P_wheel, self.transmission_eff, n_rb)
+            Load_p_m = P_m_o / P_max
+            Load_p_g = P_gen_in / P_max
+            n_mot = self.η.get_efficiency(Load_p_m, 1)
+            n_gen = self.η.get_efficiency(Load_p_g, -1)
+            P_m_in = p_motorin(P_m_o, n_mot)
+            P_g_out = p_generatorout(P_gen_in, n_gen)
+            P_aux = np.array([self.auxiliary_power] * len(v))
+            Q_hvac, Tcabin = qhvac_numba(
+                row["temp_degC"],
+                targ_temp,
+                self.cabin_volume,
+                air_flow,
+                heat_insulation.zone_layers_,
+                heat_insulation.zone_surface_,
+                heat_insulation.layer_conductivity_,
+                heat_insulation.layer_thickness_,
+                v,
+                Q_sensible=passenger_sensible_heat,
+                persons=passenger_nr,
+                air_cabin_heat_transfer_coef=air_cabin_heat_transfer_coef,
+            )
+            P_hvac = np.abs(Q_hvac[:, 0]) / cop
+            P_gen_bat_charg = P_g_out * self.battery_charge_eff * -1
+            P_bat = (P_m_in + P_aux + P_hvac) / self.battery_discharge_eff
+            P_all = P_m_in + P_aux + P_hvac + P_g_out
+            P_all_negative = P_all.copy()
+            P_all_negative[P_all_negative > 0.0] = 0.0
+            P_all_positive = P_all.copy()
+            P_all_positive[P_all_positive < 0.0] = 0.0
+            P_bat_chg = P_all_negative * self.battery_charge_eff
+            P_bat_dischg = P_all_positive / self.battery_discharge_eff
+            P_bat_actual = np.add(P_bat_dischg, P_bat_chg)  # W
+            consumption = P_bat_actual.sum() / 1000 / 3600  # kWh
+            rate = consumption / v.sum() * 100000  # kWh/100 km
 
-                # Add variables to trip object: International units (power in W)
-                trip.results["targ_temp"] = targ_temp
-                trip.results["cop"] = cop
-                trip.results["ret"] = ret
-                trip.results["frontal_area"] = frontal_area
-                trip.results["P_max"] = P_max
-                trip.results["Drag_coeff"] = f_d
-                trip.results["roll_res_coeff"] = f_r
-                trip.results["m_i"] = m_i
-                trip.results["m_c"] = m_c
-                trip.results["m_v"] = m_v
-                trip.results["P_rol"] = P_rol
-                trip.results["P_air"] = P_air
-                trip.results["P_g"] = P_g
-                trip.results["P_ine"] = P_ine
-                trip.results["P_wheel"] = P_wheel
-                trip.results["P_gen_in"] = P_gen_in
-                trip.results["Load_p_m"] = Load_p_m
-                trip.results["Load_p_g"] = Load_p_g
-                trip.results["n_mot"] = n_mot
-                trip.results["n_gen"] = n_gen
-                trip.results["P_m_in"] = P_m_in
-                trip.results["P_g_out"] = P_g_out
-                trip.results["P_aux"] = P_aux
-                trip.results["Q_hvac"] = Q_hvac
-                trip.results["Tcabin"] = Tcabin
-                trip.results["Tout"] = row["temp_degC"]
-                trip.results["P_hvac"] = P_hvac
+            trip.results["targ_temp"] = targ_temp
+            trip.results["cop"] = cop
+            trip.results["ret"] = ret
+            trip.results["frontal_area"] = frontal_area
+            trip.results["P_max"] = P_max
+            trip.results["Drag_coeff"] = f_d
+            trip.results["roll_res_coeff"] = f_r
+            trip.results["m_i"] = m_i
+            trip.results["m_c"] = m_c
+            trip.results["m_v"] = m_v
+            trip.results["P_rol"] = P_rol
+            trip.results["P_air"] = P_air
+            trip.results["P_g"] = P_g
+            trip.results["P_ine"] = P_ine
+            trip.results["P_wheel"] = P_wheel
+            trip.results["P_gen_in"] = P_gen_in
+            trip.results["Load_p_m"] = Load_p_m
+            trip.results["Load_p_g"] = Load_p_g
+            trip.results["n_mot"] = n_mot
+            trip.results["n_gen"] = n_gen
+            trip.results["P_m_in"] = P_m_in
+            trip.results["P_g_out"] = P_g_out
+            trip.results["P_aux"] = P_aux
+            trip.results["Q_hvac"] = Q_hvac
+            trip.results["Tcabin"] = Tcabin
+            trip.results["Tout"] = row["temp_degC"]
+            trip.results["P_hvac"] = P_hvac
 
-                trip.results["P_gen_bat_charg"] = P_gen_bat_charg
-                trip.results["P_bat"] = P_bat  # only all positive loads
-                trip.results[
-                    "P_bat_actual"
-                ] = P_bat_actual  # positive load after generation subtraction and negative load (generation) after
-                # positive loads subtraction
+            trip.results["P_gen_bat_charg"] = P_gen_bat_charg
+            trip.results["P_bat"] = P_bat
+            trip.results["P_bat_actual"] = P_bat_actual
 
-                # Variable for the balance
+            P_wheel_pos = P_wheel[P_wheel > 0].sum()  # Ws
+            P_wheel_neg = P_wheel[P_wheel < 0].sum() * -1  # Ws
+            P_m_o_t = P_m_o.sum()  # Ws
+            P_gen_in_t = P_gen_in.sum() * -1  # Ws
+            P_m_in_t = P_m_in.sum()  # Ws
+            P_g_out_t = P_g_out.sum() * -1  # Ws
+            P_aux_t = P_aux.sum()  # Ws
+            P_hvac_t = P_hvac.sum()  # Ws
+            heat_source = np.abs(Q_hvac[:, 0]).sum() - P_hvac_t  # Ws
+            P_gen_bat_charg_t = P_gen_bat_charg.sum()  # Ws
+            P_gen_bat_dischg_t = (
+                    P_gen_bat_charg_t * self.battery_discharge_eff
+            )  # Ws
+            P_bat_t = P_bat.sum()  # Ws
 
-                P_wheel_pos = P_wheel[P_wheel > 0].sum()  # Ws
-                P_wheel_neg = P_wheel[P_wheel < 0].sum() * -1  # Ws
-                P_m_o_t = P_m_o.sum()  # Ws
-                P_gen_in_t = P_gen_in.sum() * -1  # Ws
-                P_m_in_t = P_m_in.sum()  # Ws
-                P_g_out_t = P_g_out.sum() * -1  # Ws
-                P_aux_t = P_aux.sum()  # Ws
-                P_hvac_t = P_hvac.sum()  # Ws
-                heat_source = np.abs(Q_hvac[:, 0]).sum() - P_hvac_t  # Ws
-                P_gen_bat_charg_t = P_gen_bat_charg.sum()  # Ws
-                P_gen_bat_dischg_t = (
-                        P_gen_bat_charg_t * self.battery_discharge_eff
-                )  # Ws
-                P_bat_t = P_bat.sum()  # Ws
+            trip.consumption["value"] = consumption
+            trip.consumption["unit"] = "kWh"
+            trip.rate["value"] = rate
+            trip.rate["unit"] = "kWh/100 km"
 
-                trip.consumption[
-                    "value"
-                ] = consumption  # the only option this value be to small or negative is the ev goes downhill most of
-                # the trip
-                trip.consumption["unit"] = "kWh"
-                trip.rate["value"] = rate
-                trip.rate["unit"] = "kWh/100 km"
+            loss_gen = P_gen_in_t - P_g_out_t
+            loss_trans_m = P_m_o_t - P_wheel_pos
+            loss_trans_g = P_wheel_neg - P_gen_in_t
+            loss_motor = P_m_in_t - P_m_o_t
+            loss_gen_bat_charg = P_gen_bat_charg_t * (1 - self.battery_charge_eff)
+            loss_gen_bat_dischg = P_gen_bat_charg_t * (
+                    1 - self.battery_discharge_eff
+            )
+            loss_bat = P_bat_t * (1 - self.battery_discharge_eff)
 
-                loss_gen = P_gen_in_t - P_g_out_t
-                loss_trans_m = P_m_o_t - P_wheel_pos
-                loss_trans_g = P_wheel_neg - P_gen_in_t
-                loss_motor = P_m_in_t - P_m_o_t
-                loss_gen_bat_charg = P_gen_bat_charg_t * (1 - self.battery_charge_eff)
-                loss_gen_bat_dischg = P_gen_bat_charg_t * (
-                        1 - self.battery_discharge_eff
-                )
-                loss_bat = P_bat_t * (1 - self.battery_discharge_eff)
+            if ret == 1:
+                cooling = 0
+                heating = P_hvac_t + heat_source
+            elif ret == -1:
+                cooling = P_hvac_t + heat_source
+                heating = 0
+            elif ret == 0:
+                cooling = 0
+                heating = 0
 
-                if ret == 1:
-                    cooling = 0
-                    heating = P_hvac_t + heat_source
-                elif ret == -1:
-                    cooling = P_hvac_t + heat_source
-                    heating = 0
-                elif ret == 0:
-                    cooling = 0
-                    heating = 0
+            j = np.zeros((v.shape[0], 7))
+            j[:, 0] = P_rol
+            j[:, 1] = P_air
+            j[:, 2] = P_g
+            j[:, 3] = P_ine
+            j[:, 4] = np.sum(j[:, 0:4], axis=1)
+            j[:, 5] = j[:, 4]
+            j[np.where(j[:, 5] > 0.0), 5] = 0
+            j[:, 6] = j[:, 4]
+            j[np.where(j[:, 6] < 0.0), 6] = 0
 
-                # data for sankey diagram
-                j = np.zeros((v.shape[0], 7))
-                j[:, 0] = P_rol
-                j[:, 1] = P_air
-                j[:, 2] = P_g
-                j[:, 3] = P_ine
-                j[:, 4] = np.sum(j[:, 0:4], axis=1)
-                j[:, 5] = j[:, 4]
-                j[np.where(j[:, 5] > 0.0), 5] = 0
-                j[:, 6] = j[:, 4]
-                j[np.where(j[:, 6] < 0.0), 6] = 0
+            ig = np.zeros((v.shape[0], 4))
+            ig[np.where(j[:, 5] < 0.0), 0:4] = j[np.where(j[:, 5] < 0.0), 0:4]
+            ig[np.where(ig[:, 0] > 0.0), 0] = 0
+            ig[np.where(ig[:, 1] > 0.0), 1] = 0
+            ig[np.where(ig[:, 2] > 0.0), 2] = 0
+            ig[np.where(ig[:, 3] > 0.0), 3] = 0
+            xg = np.true_divide(
+                ig,
+                ig.sum(axis=1, keepdims=True),
+                out=np.zeros_like(ig),
+                where=ig.sum(axis=1, keepdims=True) != 0,
+            )
+            yg = (xg.T * j[:, 5]).T * -1
+            zg = yg.sum(axis=0)
 
-                ig = np.zeros((v.shape[0], 4))
-                ig[np.where(j[:, 5] < 0.0), 0:4] = j[np.where(j[:, 5] < 0.0), 0:4]
-                ig[np.where(ig[:, 0] > 0.0), 0] = 0
-                ig[np.where(ig[:, 1] > 0.0), 1] = 0
-                ig[np.where(ig[:, 2] > 0.0), 2] = 0
-                ig[np.where(ig[:, 3] > 0.0), 3] = 0
-                xg = np.true_divide(
-                    ig,
-                    ig.sum(axis=1, keepdims=True),
-                    out=np.zeros_like(ig),
-                    where=ig.sum(axis=1, keepdims=True) != 0,
-                )
-                yg = (xg.T * j[:, 5]).T * -1
-                zg = yg.sum(axis=0)
+            ip = np.zeros((v.shape[0], 4))
+            ip[np.where(j[:, 6] > 0.0), 0:4] = j[np.where(j[:, 6] > 0.0), 0:4]
+            ip[np.where(ip[:, 0] < 0.0), 0] = 0
+            ip[np.where(ip[:, 1] < 0.0), 1] = 0
+            ip[np.where(ip[:, 2] < 0.0), 2] = 0
+            ip[np.where(ip[:, 3] < 0.0), 3] = 0
+            xp = np.true_divide(
+                ip,
+                ip.sum(axis=1, keepdims=True),
+                out=np.zeros_like(ip),
+                where=ip.sum(axis=1, keepdims=True) != 0,
+            )
+            yp = (xp.T * j[:, 6]).T
+            zp = yp.sum(axis=0)
+            gra_neg = zg[2]
+            acc_neg = zg[3]
 
-                ip = np.zeros((v.shape[0], 4))
-                ip[np.where(j[:, 6] > 0.0), 0:4] = j[np.where(j[:, 6] > 0.0), 0:4]
-                ip[np.where(ip[:, 0] < 0.0), 0] = 0
-                ip[np.where(ip[:, 1] < 0.0), 1] = 0
-                ip[np.where(ip[:, 2] < 0.0), 2] = 0
-                ip[np.where(ip[:, 3] < 0.0), 3] = 0
-                xp = np.true_divide(
-                    ip,
-                    ip.sum(axis=1, keepdims=True),
-                    out=np.zeros_like(ip),
-                    where=ip.sum(axis=1, keepdims=True) != 0,
-                )
-                yp = (xp.T * j[:, 6]).T
-                zp = yp.sum(axis=0)
-                gra_neg = zg[2]
-                acc_neg = zg[3]
+            rol_pos = zp[0]
+            air_pos = zp[1]
+            gra_pos = zp[2]
+            acc_pos = zp[3]
 
-                rol_pos = zp[0]
-                air_pos = zp[1]
-                gra_pos = zp[2]
-                acc_pos = zp[3]
+            rate_list.append(rate)
+            consumption_list.append(consumption)
+            P_bat_t_list.append(P_bat_t / 3600 / 1000)
+            P_gen_bat_dischg_t_list.append(P_gen_bat_dischg_t / 3600 / 1000)
+            P_aux_t_list.append(P_aux_t / 3600 / 1000)
+            P_hvac_t_list.append(P_hvac_t / 3600 / 1000)
+            P_m_in_t_list.append(P_m_in_t / 3600 / 1000)
+            P_m_o_t_list.append(P_m_o_t / 3600 / 1000)
+            P_wheel_pos_list.append(P_wheel_pos / 3600 / 1000)
+            rol_pos_list.append(rol_pos / 3600 / 1000)
+            air_pos_list.append(air_pos / 3600 / 1000)
+            gra_pos_list.append(gra_pos / 3600 / 1000)
+            acc_pos_list.append(acc_pos / 3600 / 1000)
+            trip_codes_list.append(trip.code)
 
-                self.profile.loc[i, "consumption kWh/100 km"] = rate
-                self.profile.loc[i, "consumption kWh"] = consumption
-                self.profile.loc[i, "battery discharge kWh"] = P_bat_t / 3600 / 1000
-                self.profile.loc[i, "regeneration kWh"] = (
-                        P_gen_bat_dischg_t / 3600 / 1000
-                )
-                self.profile.loc[i, "auxiliary kWh"] = P_aux_t / 3600 / 1000
-                self.profile.loc[i, "hvac kWh"] = P_hvac_t / 3600 / 1000
-                self.profile.loc[i, "motor in kWh"] = P_m_in_t / 3600 / 1000
-                self.profile.loc[i, "transmission in kWh"] = P_m_o_t / 3600 / 1000
-                self.profile.loc[i, "wheel kWh"] = P_wheel_pos / 3600 / 1000
-                self.profile.loc[i, "rolling res kWh"] = rol_pos / 3600 / 1000
-                self.profile.loc[i, "air res kWh"] = air_pos / 3600 / 1000
-                self.profile.loc[i, "gravity kWh"] = gra_pos / 3600 / 1000
-                self.profile.loc[i, "acceleration kWh"] = acc_pos / 3600 / 1000
-                self.profile.loc[i, "trip code"] = trip.code
-
-                stv = [
-                    ["Heat source", "HVAC", heat_source / 3600 / 1000],
-                    ["Potential energy", "Gravity force", gra_neg / 3600 / 1000],
-                    [
-                        "Battery",
-                        "Discharge",
-                        (P_bat_t - P_gen_bat_charg_t) / 3600 / 1000,
-                    ],
-                    [
-                        "Discharge",
-                        "Losses",
-                        (loss_bat + loss_gen_bat_dischg) / 3600 / 1000,
-                    ],
-                    ["Discharge", "HVAC", P_hvac_t / 3600 / 1000],
-                    ["Discharge", "Auxiliary", P_aux_t / 3600 / 1000],
-                    ["Discharge", "Motor", P_m_in_t / 3600 / 1000],
-                    [
-                        "reg_braking",
-                        "Discharge",
-                        P_gen_bat_dischg_t / 3600 / 1000,
-                    ],
-                    [
-                        "reg_braking",
-                        "Losses",
-                        loss_gen_bat_charg / 3600 / 1000,
-                    ],
-                    ["HVAC", "Cooling", cooling / 3600 / 1000],
-                    ["HVAC", "Heating", heating / 3600 / 1000],
-                    ["Motor", "Transmission of traction", P_m_o_t / 3600 / 1000],
-                    ["Motor", "Losses", loss_motor / 3600 / 1000],
-                    ["Transmission of traction", "Wheel", P_wheel_pos / 3600 / 1000],
-                    ["Transmission of traction", "Losses", loss_trans_m / 3600 / 1000],
-                    ["Wheel", "Rolling resistance", rol_pos / 3600 / 1000],
-                    ["Wheel", "Air resistance", air_pos / 3600 / 1000],
-                    ["Wheel", "Gravity force", gra_pos / 3600 / 1000],
-                    ["Wheel", "Acceleration force", acc_pos / 3600 / 1000],
-                    ["Rolling resistance", "Losses", rol_pos / 3600 / 1000],
-                    ["Air resistance", "Losses", air_pos / 3600 / 1000],
-                    ["Gravity force", "Kinetic energy", gra_neg / 3600 / 1000],
-                    ["Gravity force", "Losses", (gra_pos - gra_neg) / 3600 / 1000],
-                    ["Acceleration force", "Kinetic energy", acc_neg / 3600 / 1000],
-                    ["Acceleration force", "Losses", (acc_pos - acc_neg) / 3600 / 1000],
-                    [
-                        "Kinetic energy",
-                        "Transmission of regenerative",
-                        (acc_neg + gra_neg) / 3600 / 1000,
-                    ],
-                    [
-                        "Transmission of regenerative",
-                        "Generator",
-                        P_gen_in_t / 3600 / 1000,
-                    ],
-                    [
-                        "Transmission of regenerative",
-                        "Losses",
-                        loss_trans_g / 3600 / 1000,
-                    ],
-                    ["Generator", "reg_braking", P_g_out_t / 3600 / 1000],
-                    ["Generator", "Losses", loss_gen / 3600 / 1000],
-                    ["Cooling", "Losses", cooling / 3600 / 1000],
-                    ["Heating", "Losses", heating / 3600 / 1000],
-                    ["Auxiliary", "Losses", P_aux_t / 3600 / 1000],
-                ]
-
-                link_label = []
-                for lk in stv:
-                    llk = [lk[0], lk[1], str(round(lk[2], 1))]
-                    link_label.append("->".join(llk))
-
-                sort = np.array(stv, dtype=object)
-                s = sort.T[0].tolist()
-                t = sort.T[1].tolist()
-                v = sort.T[2]
-
-                balance = {}
-                balance["label"] = [
-                    "Heat source",
-                    "Potential energy",
+            stv = [
+                ["Heat source", "HVAC", heat_source / 3600 / 1000],
+                ["Potential energy", "Gravity force", gra_neg / 3600 / 1000],
+                [
                     "Battery",
                     "Discharge",
-                    "reg_braking",
-                    "HVAC",
-                    "Motor",
-                    "Generator",
-                    "Transmission of traction",
-                    "Wheel",
-                    "Kinetic energy",
-                    "Cooling",
-                    "Heating",
-                    "Auxiliary",
-                    "Gravity force",
-                    "Acceleration force",
-                    "Rolling resistance",
-                    "Air resistance",
+                    (P_bat_t - P_gen_bat_charg_t) / 3600 / 1000,
+                ],
+                [
+                    "Discharge",
                     "Losses",
+                    (loss_bat + loss_gen_bat_dischg) / 3600 / 1000,
+                ],
+                ["Discharge", "HVAC", P_hvac_t / 3600 / 1000],
+                ["Discharge", "Auxiliary", P_aux_t / 3600 / 1000],
+                ["Discharge", "Motor", P_m_in_t / 3600 / 1000],
+                [
+                    "reg_braking",
+                    "Discharge",
+                    P_gen_bat_dischg_t / 3600 / 1000,
+                ],
+                [
+                    "reg_braking",
+                    "Losses",
+                    loss_gen_bat_charg / 3600 / 1000,
+                ],
+                ["HVAC", "Cooling", cooling / 3600 / 1000],
+                ["HVAC", "Heating", heating / 3600 / 1000],
+                ["Motor", "Transmission of traction", P_m_o_t / 3600 / 1000],
+                ["Motor", "Losses", loss_motor / 3600 / 1000],
+                ["Transmission of traction", "Wheel", P_wheel_pos / 3600 / 1000],
+                ["Transmission of traction", "Losses", loss_trans_m / 3600 / 1000],
+                ["Wheel", "Rolling resistance", rol_pos / 3600 / 1000],
+                ["Wheel", "Air resistance", air_pos / 3600 / 1000],
+                ["Wheel", "Gravity force", gra_pos / 3600 / 1000],
+                ["Wheel", "Acceleration force", acc_pos / 3600 / 1000],
+                ["Rolling resistance", "Losses", rol_pos / 3600 / 1000],
+                ["Air resistance", "Losses", air_pos / 3600 / 1000],
+                ["Gravity force", "Kinetic energy", gra_neg / 3600 / 1000],
+                ["Gravity force", "Losses", (gra_pos - gra_neg) / 3600 / 1000],
+                ["Acceleration force", "Kinetic energy", acc_neg / 3600 / 1000],
+                ["Acceleration force", "Losses", (acc_pos - acc_neg) / 3600 / 1000],
+                [
+                    "Kinetic energy",
                     "Transmission of regenerative",
-                ]
-                balance["source"] = [balance["label"].index(i) for i in s]
-                balance["target"] = [balance["label"].index(i) for i in t]
-                balance["value"] = v
-                balance["link_label"] = link_label
-                balance["data"] = stv
-                trip.balance = balance
+                    (acc_neg + gra_neg) / 3600 / 1000,
+                ],
+                [
+                    "Transmission of regenerative",
+                    "Generator",
+                    P_gen_in_t / 3600 / 1000,
+                ],
+                [
+                    "Transmission of regenerative",
+                    "Losses",
+                    loss_trans_g / 3600 / 1000,
+                ],
+                ["Generator", "reg_braking", P_g_out_t / 3600 / 1000],
+                ["Generator", "Losses", loss_gen / 3600 / 1000],
+                ["Cooling", "Losses", cooling / 3600 / 1000],
+                ["Heating", "Losses", heating / 3600 / 1000],
+                ["Auxiliary", "Losses", P_aux_t / 3600 / 1000],
+            ]
+
+            link_label = []
+            for lk in stv:
+                llk = [lk[0], lk[1], str(round(lk[2], 1))]
+                link_label.append("->".join(llk))
+
+            sort = np.array(stv, dtype=object)
+            s = sort.T[0].tolist()
+            t = sort.T[1].tolist()
+            v = sort.T[2]
+
+            balance = {}
+            balance["label"] = [
+                "Heat source",
+                "Potential energy",
+                "Battery",
+                "Discharge",
+                "reg_braking",
+                "HVAC",
+                "Motor",
+                "Generator",
+                "Transmission of traction",
+                "Wheel",
+                "Kinetic energy",
+                "Cooling",
+                "Heating",
+                "Auxiliary",
+                "Gravity force",
+                "Acceleration force",
+                "Rolling resistance",
+                "Air resistance",
+                "Losses",
+                "Transmission of regenerative",
+            ]
+            balance["source"] = [balance["label"].index(i) for i in s]
+            balance["target"] = [balance["label"].index(i) for i in t]
+            balance["value"] = v
+            balance["link_label"] = link_label
+            balance["data"] = stv
+            trip.balance = balance
+
+        # Bulk-Zuweisung (vektorisiert statt vieler .loc pro Trip)
+        scale = 3600.0 * 1000.0
+        self.profile.loc[driving_indices, "consumption kWh/100 km"] = np.array(rate_list)
+        self.profile.loc[driving_indices, "consumption kWh"] = np.array(consumption_list)
+        self.profile.loc[driving_indices, "battery discharge kWh"] = np.array(P_bat_t_list)
+        self.profile.loc[driving_indices, "regeneration kWh"] = np.array(P_gen_bat_dischg_t_list)
+        self.profile.loc[driving_indices, "auxiliary kWh"] = np.array(P_aux_t_list)
+        self.profile.loc[driving_indices, "hvac kWh"] = np.array(P_hvac_t_list)
+        self.profile.loc[driving_indices, "motor in kWh"] = np.array(P_m_in_t_list)
+        self.profile.loc[driving_indices, "transmission in kWh"] = np.array(P_m_o_t_list)
+        self.profile.loc[driving_indices, "wheel kWh"] = np.array(P_wheel_pos_list)
+        self.profile.loc[driving_indices, "rolling res kWh"] = np.array(rol_pos_list)
+        self.profile.loc[driving_indices, "air res kWh"] = np.array(air_pos_list)
+        self.profile.loc[driving_indices, "gravity kWh"] = np.array(gra_pos_list)
+        self.profile.loc[driving_indices, "acceleration kWh"] = np.array(acc_pos_list)
+        self.profile.loc[driving_indices, "trip code"] = trip_codes_list
+
         print("")
         self._fill_rows()
 

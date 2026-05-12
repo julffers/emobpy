@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emobpy"
+version = "0.6.3"
+description = "Time series for battery electric vehicles modeling"
+readme = "README.rst"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+  { name = "Carlos Gaete-Morales", email = "cdgaete@gmail.com" }
+]
+classifiers = [
+  "Intended Audience :: End Users/Desktop",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Scientific/Engineering :: Visualization"
+]
+dependencies = [
+  "appdirs",
+  "plotly",
+  "pyyaml",
+  "pandas",
+  "wget",
+  "numba"
+]
+
+[project.scripts]
+emobpy = "emobpy.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["emobpy*"]

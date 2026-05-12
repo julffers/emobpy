@@ -137,7 +137,7 @@ class Export:
             self.optdict = dict(zip(self.setopt, range(len(self.setopt))))
             self.arr_options = np.empty((len(self.setopt), len(self.code), self.rows))
             for id1, cd in enumerate(self.code):
-                if self.subscen[cd]:
+                if cd in self.subscen and self.subscen[cd]:
                     for key, value in self.subscen[cd].items():
                         id0 = self.optdict[key]
                         df = self.data.db[value]["timeseries"][
@@ -165,7 +165,8 @@ class Export:
         self.final["Hour", "-", "-"] = ["h" + str(j + 1) for j in range(self.rows)]
         self.final.set_index(("Hour", "-", "-"), inplace=True)
         self.final.index.name = "Hour"
-        self.final = self.final.round(7)
+        _num = self.final.select_dtypes(include="number").columns
+        self.final[_num] = self.final[_num].astype(np.float64).round(7)
 
     def save_files(self, repository=""):
         """

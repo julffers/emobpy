@@ -49,6 +49,49 @@ from .logger import get_logger
 logger = get_logger(__name__)
 
 
+@jit(nopython=True)
+def _charging_cap_numba(state_is_driving, consumption, charging_cap, t, battery_capacity):
+    """
+    Berechnet die angepasste charging_cap-Spalte (0 wo keine Lademöglichkeit).
+    state_is_driving[i] == 1 bedeutet state == 'driving'.
+    """
+    n = consumption.shape[0]
+    out_cap = np.empty_like(charging_cap)
+    for i in range(n):
+        out_cap[i] = charging_cap[i]
+    flag = False
+    cumcons = 0.0
+    cumchrg = 0.0
+    for i in range(n):
+        if flag:
+            if state_is_driving[i]:
+                if cumcons != 0 and cumchrg == 0:
+                    cumcons += consumption[i]
+                    if cumcons < battery_capacity * 0.50:
+                        out_cap[i] = 0.0
+                        cumchrg = 0.0
+                    else:
+                        cumchrg += charging_cap[i] * t
+                        cumcons = 0.0
+                else:
+                    cumchrg += charging_cap[i] * t
+                    if cumchrg > battery_capacity * 0.5:
+                        cumchrg = 0.0
+                        cumcons = 0.001
+            else:
+                flag = False
+        elif state_is_driving[i]:
+            flag = True
+            cumcons = consumption[i]
+            if cumcons < battery_capacity * 0.65:
+                out_cap[i] = 0.0
+                cumchrg = 0.0
+            else:
+                cumchrg = charging_cap[i] * t
+                cumcons = 0.0
+    return out_cap
+
+
 ################################################################
 # These functions are for grid availability profile creation ###
 ################################################################
@@ -439,20 +482,19 @@ class Availability:
         self.dt = pd.DataFrame(columns=self.db.columns)
         self.dt.loc[:, "hh"] = np.arange(0, self.hours, self.t)
 
-        # Start New version, which works for 1s-based profiles:
-        temp_timeseries = [round(num*3600) for num in self.dt["hh"]]
-        temp_db = [round(num*3600) for num in self.db["hr"]]
-        temp_intersection_list = list(set(temp_timeseries).intersection(temp_db))
-
-        self.idx = []
-        for i in temp_intersection_list:
-            self.idx.append(temp_timeseries.index(i))
-        self.idx = np.sort(self.idx).tolist()
-        # End new version
+        # Vektorisiert (wie in mobility._fill_rows): Index-Suche mit NumPy
+        temp_ts = np.round(self.dt["hh"].values * 3600).astype(np.int64)
+        temp_db = np.round(self.db["hr"].values * 3600).astype(np.int64)
+        order = np.argsort(temp_ts)
+        sorted_ts = temp_ts[order]
+        pos = np.searchsorted(sorted_ts, temp_db)
+        idx = order[pos]
+        sorted_by_idx = np.argsort(idx)
+        self.idx = idx[sorted_by_idx].tolist()
 
         self.mixed = self.repeats_str + self.repeats_float + self.fixed + self.copied
         for r in self.mixed:
-            self.val = self.db[r].values.tolist()
+            self.val = self.db[r].values[sorted_by_idx]
             self.dt.loc[self.idx, r] = self.val
         self.dt.loc[self.totalrows - 1, "state"] = self.db["state"].iloc[-1]
         self.dt.loc[self.totalrows - 1, "hr"] = self.dt["hh"][self.totalrows - 1]
@@ -464,7 +506,7 @@ class Availability:
         for sm in self.same:
             self.dt.loc[:, sm] = self.db[sm].values.tolist()[0]
         for cal in self.calc:
-            self.dt.loc[:, cal] = self.dt["hh"].apply(lambda x: x % 24)
+            self.dt.loc[:, cal] = self.dt["hh"].values % 24
         self.dt.loc[:, "count"] = self.dt.groupby(["hr", "state"])[
             "consumption"
         ].transform("count")
@@ -474,40 +516,15 @@ class Availability:
         self.dt.loc[:, "distance"] = (
             self.dt.loc[:, "distance"] / self.dt.loc[:, "count"]
         )
-        # convert this section to numba
-        flag = False
-        for i, row in self.dt.iterrows():
-            if flag:
-                if row["state"] == "driving":
-                    flag = True
-                    if self.cumcons != 0 and self.cumchrg == 0:
-                        self.cumcons += row["consumption"]
-                        if self.cumcons < self.battery_capacity * 0.50:
-                            self.dt.loc[i, "charging_cap"] = 0
-                            self.dt.loc[i, "charging_point"] = "none"
-                            self.cumchrg = 0
-                        else:
-                            self.cumchrg += row["charging_cap"] * self.t
-                            self.cumcons = 0
-                    else:
-                        self.cumchrg += row["charging_cap"] * self.t
-                        if self.cumchrg > self.battery_capacity * 0.5:
-                            self.cumchrg = 0
-                            self.cumcons += 0.001
-                        else:
-                            pass
-                else:
-                    flag = False
-            elif row["state"] == "driving":
-                flag = True
-                self.cumcons = row["consumption"]
-                if self.cumcons < self.battery_capacity * 0.65:
-                    self.dt.loc[i, "charging_cap"] = 0
-                    self.dt.loc[i, "charging_point"] = "none"
-                    self.cumchrg = 0
-                else:
-                    self.cumchrg = row["charging_cap"] * self.t
-                    self.cumcons = 0
+        state_is_driving = (self.dt["state"] == "driving").values.astype(np.float64)
+        consumption_arr = self.dt["consumption"].values.astype(np.float64)
+        charging_cap_arr = self.dt["charging_cap"].values.astype(np.float64)
+        new_cap = _charging_cap_numba(
+            state_is_driving, consumption_arr, charging_cap_arr,
+            self.t, self.battery_capacity,
+        )
+        self.dt.loc[:, "charging_cap"] = new_cap
+        self.dt.loc[self.dt["charging_cap"] == 0, "charging_point"] = "none"
 
     def run(self):
         """
